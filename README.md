@@ -33,7 +33,7 @@ Auto-Server Lifecycle: 서버가 없으면 자동으로 빈 포트를 찾아 기
 
 - digdag start_server : 서버 기동
 - digdag kill_server : 서버 종료
-- digdag run_workflow <project> <workflow> : 서버 기동 + push + start
+- digdag run_workflow : 서버 기동 + push + start
 - digdag list_job : attempts 목록 조회
 - digdag kill_job : attempts kill
 - digdag browse : UI 열기
