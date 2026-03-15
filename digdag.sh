@@ -783,9 +783,12 @@ cmd_kill_server() {
     esac
 
     # ── kill ─────────────────────────────────────────────────
+    # setsid 로 기동했으므로 서버 PID = 프로세스 그룹 ID = 세션 ID
+    # kill -- -$pid : 프로세스 그룹 전체에 SIGTERM 전송
+    #   → 서버 JVM + 하위 shell task 자식 프로세스 모두 즉시 종료
     log "
-  PID $pid 종료 중..."
-    if kill "$pid" 2>/dev/null; then
+  PID $pid (프로세스 그룹 전체) 종료 중..."
+    if kill -- "-$pid" 2>/dev/null; then
         # 포트가 닫힐 때까지 대기 (최대 10초)
         local i
         for (( i=1; i<=10; i++ )); do
@@ -794,7 +797,7 @@ cmd_kill_server() {
         done
         # lock/info 파일 정리 (감시 프로세스가 못 지운 경우 대비)
         rm -f "$LOCK_FILE" "$INFO_FILE"
-        log "${GREEN}[DONE] 서버가 종료되었습니다.${NC}"
+        log "${GREEN}[DONE] 서버 및 하위 프로세스가 모두 종료되었습니다.${NC}"
     else
         log "${RED}[ERROR] kill 실패. 이미 종료되었거나 권한이 없습니다.${NC}"
         exit 1
