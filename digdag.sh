@@ -82,7 +82,7 @@
 
 # ── 설정 ────────────────────────────────────────────────────
 BASE_PORT=65432
-MAX_RETRIES=10
+MAX_RETRIES=50
 BOOT_TIMEOUT=15
 LOCK_TIMEOUT=60            # 후발 프로세스 최대 대기 시간 (초)
 USER_NAME=$(id -un)
