@@ -131,12 +131,21 @@ find_my_digdag_server_pid() {
 }
 
 # PID -> 포트 추출
+# ss -tlnp 는 newgrp 환경에서 users 컬럼이 누락될 수 있으므로
+# /proc/<pid>/net/tcp 를 직접 읽어 포트를 추출 (그룹 무관하게 동작)
 find_port_by_pid() {
-    ss -tlnp 2>/dev/null \
-        | grep "pid=$1," \
-        | awk '{print $4}' \
-        | awk -F':' '{print $NF}' \
-        | head -1
+    local pid="$1"
+    # /proc/<pid>/net/tcp: 로컬 주소 컬럼(2번)이 hex로 인코딩됨
+    # LISTEN 상태(0A) 인 소켓의 포트만 추출
+    local port_hex port_dec
+    port_hex=$(cat "/proc/$pid/net/tcp" 2>/dev/null \
+        | awk 'NR>1 && $4=="0A" {print $2}' \
+        | awk -F: '{print $2}' \
+        | head -1)
+    [ -z "$port_hex" ] && return 1
+    # hex → decimal 변환
+    port_dec=$(printf '%d' "0x${port_hex}" 2>/dev/null)
+    [ -n "$port_dec" ] && echo "$port_dec"
 }
 # ── 보안 1: DIGDAG_JAR 유효성 확인 및 실행 명령 구성 ────────
 # jar 방식으로 직접 지정하므로 which 탐색 불필요
@@ -636,7 +645,8 @@ _s "서버 종료 중 (PORT=${_port})..."
 _jn=$(basename "$_jar")
 while IFS= read -r _p || [ -n "$_p" ]; do
     [ -z "$_p" ] && continue
-    _pp=$(ss -tlnp 2>/dev/null | grep "pid=${_p}," | awk '{print $4}' | awk -F: '{print $NF}' | head -1)
+    _ph=$(awk 'NR>1 && $4=="0A" {print $2}' "/proc/${_p}/net/tcp" 2>/dev/null | awk -F: '{print $2}' | head -1)
+    _pp=$(printf '%d' "0x${_ph}" 2>/dev/null)
     if [ "$_pp" = "$_port" ]; then
         kill -- "-${_p}" 2>/dev/null
         [ -n "$_od" ] && [ -d "$_od" ] && rm -rf "$_od"
