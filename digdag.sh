@@ -131,21 +131,40 @@ find_my_digdag_server_pid() {
 }
 
 # Extract port from PID
-# ss -tlnp may omit users column under newgrp,
-# so read /proc/<pid>/net/tcp directly (group-independent).
+# Strategy:
+#   1. Check server.info first (start_server: no blocking)
+#   2. Check once.*/server.info  (--once servers: no blocking)
+#   3. Fallback: ss -tlnp (may miss users column under newgrp, but non-blocking)
 find_port_by_pid() {
     local pid="$1"
-    # /proc/<pid>/net/tcp: local address column(2) is hex-encoded
-    # Extract port from LISTEN(0A) sockets only
-    local port_hex port_dec
-    port_hex=$(cat "/proc/$pid/net/tcp" 2>/dev/null \
-        | awk 'NR>1 && $4=="0A" {print $2}' \
-        | awk -F: '{print $2}' \
-        | head -1)
-    [ -z "$port_hex" ] && return 1
-    # Convert hex to decimal
-    port_dec=$(printf '%d' "0x${port_hex}" 2>/dev/null)
-    [ -n "$port_dec" ] && echo "$port_dec"
+
+    # 1. start_server server.info
+    if [ -f "$INFO_FILE" ]; then
+        local info_pid
+        info_pid=$(grep '^PID=' "$INFO_FILE" 2>/dev/null | cut -d= -f2)
+        if [ "$info_pid" = "$pid" ]; then
+            grep '^PORT=' "$INFO_FILE" | cut -d= -f2
+            return 0
+        fi
+    fi
+
+    # 2. --once server.info (once.* subdirectories)
+    for _od in "${DIGDAG_TMP_DIR}"/once.*/; do
+        [ -f "${_od}server.info" ] || continue
+        local info_pid
+        info_pid=$(grep '^PID=' "${_od}server.info" 2>/dev/null | cut -d= -f2)
+        if [ "$info_pid" = "$pid" ]; then
+            grep '^PORT=' "${_od}server.info" | cut -d= -f2
+            return 0
+        fi
+    done
+
+    # 3. Fallback: ss (non-blocking, works even if users column is missing)
+    ss -tlnp 2>/dev/null \
+        | grep "pid=$pid," \
+        | awk '{print $4}' \
+        | awk -F':' '{print $NF}' \
+        | head -1
 }
 # ── Security 1: Validate DIGDAG_JAR and build exec command ────────
 # Direct jar path avoids which-based lookup
@@ -233,6 +252,13 @@ start_server() {
             log "  ${YELLOW}[Attempt $i/$MAX_RETRIES]${NC} Port ${BOLD}$port${NC} checking..."
 
             if port_in_use $port; then
+                # Warn if BASE_PORT is in use but no server.info exists
+                # -> likely a zombie server (tmp dir was cleaned up)
+                if [ "$port" -eq "$BASE_PORT" ] && [ ! -f "$INFO_FILE" ]; then
+                    log "  ${RED}[WARN] Port $port is in use but no server.info found.${NC}"
+                    log "         A zombie server may exist (tmp dir was auto-cleaned)."
+                    log "         Run: kill \$(ss -tlnp | grep ':$port' | grep -oP 'pid=\K[0-9]+')"
+                fi
                 log "  [ERROR] Port $port in use -> try next port"
                 ((port++)); continue
             fi
@@ -280,13 +306,18 @@ EOF
                     local watch_port="$port"
                     local watch_lock="$LOCK_FILE"
                     local watch_info="$INFO_FILE"
-                    local jar_name
-                    jar_name=$(basename "$DIGDAG_JAR")
+                    local watch_dir="$DIGDAG_TMP_DIR"
                     # Prevent PID reuse: verify server existence via find_my_digdag_server_pid
                     # Port closed = server dead (most reliable indicator)
                     while (echo > /dev/tcp/$HOST_NAME/$watch_port) >/dev/null 2>&1; do
                         sleep 5
-                        touch "$watch_lock" "$watch_info" 2>/dev/null
+                        # Touch both files AND directories to prevent
+                        # HPC /tmp auto-cleanup (tmpwatch/systemd-tmpfiles
+                        # deletes dirs based on atime, not just files)
+                        touch "$watch_lock" "$watch_info" \
+                              "$watch_dir" \
+                              "${watch_dir}/task-logs" \
+                              "${watch_dir}/jvm-tmp" 2>/dev/null
                     done
                     rm -f "$watch_lock"
                 ) &
@@ -645,8 +676,18 @@ _s "Stopping server (PORT=${_port})..."
 _jn=$(basename "$_jar")
 while IFS= read -r _p || [ -n "$_p" ]; do
     [ -z "$_p" ] && continue
-    _ph=$(awk 'NR>1 && $4=="0A" {print $2}' "/proc/${_p}/net/tcp" 2>/dev/null | awk -F: '{print $2}' | head -1)
-    _pp=$(printf '%d' "0x${_ph}" 2>/dev/null)
+    _pp=$(ss -tlnp 2>/dev/null | grep "pid=${_p}," | awk '{print $4}' | awk -F: '{print $NF}' | head -1)
+    # fallback: check once.*/server.info
+    if [ -z "$_pp" ]; then
+        for _sif in "${DIGDAG_TMP_DIR}"/once.*/server.info "${DIGDAG_TMP_DIR}"/server.info; do
+            [ -f "$_sif" ] || continue
+            _spid=$(grep '^PID=' "$_sif" 2>/dev/null | cut -d= -f2)
+            if [ "$_spid" = "$_p" ]; then
+                _pp=$(grep '^PORT=' "$_sif" | cut -d= -f2)
+                break
+            fi
+        done
+    fi
     if [ "$_pp" = "$_port" ]; then
         kill -- "-${_p}" 2>/dev/null
         [ -n "$_od" ] && [ -d "$_od" ] && rm -rf "$_od"
