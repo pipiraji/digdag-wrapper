@@ -71,14 +71,25 @@ for _d in (DIGDAG_TMP_DIR, DASHBOARD_DIR):
 #  Data
 # ══════════════════════════════════════════════════════════════
 @dataclass
+class AttemptInfo:
+    """Single running attempt on a server."""
+    attempt_id:  str   # numeric id
+    attempt_url: str   # http://host:port/attempts/{id}
+    project:     str
+    workflow:    str
+
+
+@dataclass
 class ServerInfo:
-    no:      str
-    pid:     str
-    port:    str
-    url:     str
-    user:    str                        # OS user who owns the process
-    running: list = field(default_factory=list)
-    owner:   str  = ""                  # same as user; explicit for frontend
+    no:       str
+    pid:      str
+    port:     str
+    url:      str       # base server URL (or /attempts/N if single running)
+    user:     str       # OS user who owns the process
+    running:  list = field(default_factory=list)   # ["proj/wf", ...]
+    owner:    str  = ""
+    attempts: list = field(default_factory=list)   # list[AttemptInfo]
+    base_url: str  = ""  # always http://host:port (without /attempts/N)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -112,19 +123,60 @@ def _parse_list_server(raw: str, user: str) -> list[ServerInfo]:
             continue
 
         if no_v:
+            # Extract base URL (strip /attempts/N if present)
+            import re as _re
+            base_url_v = _re.sub(r"/attempts/\d+.*$", "", url_v)
+            # Extract attempt id from URL if present
+            _aid_m = _re.search(r"/attempts/(\d+)", url_v)
+            _attempt_id = _aid_m.group(1) if _aid_m else ""
             current = ServerInfo(no=no_v, pid=pid_v, port=port_v,
-                                 url=url_v, user=user, running=[], owner=user)
+                                 url=url_v, user=user, running=[], owner=user,
+                                 attempts=[], base_url=base_url_v)
+            # Store first attempt id (from URL) — running list will add more
+            current._first_aid = _attempt_id
             servers.append(current)
             if run_v and run_v not in ("(none)", "(없음)"):
                 current.running.append(run_v)
         elif current and run_v and run_v != "(none)":
             current.running.append(run_v)
 
+    # Build AttemptInfo list for each server
+    import re as _re
+    for s in servers:
+        first_aid = getattr(s, "_first_aid", "")
+        if len(s.running) == 0:
+            # No running attempts
+            s.attempts = []
+        elif len(s.running) == 1:
+            # Single attempt — attempt id may be in URL
+            proj_wf = s.running[0]
+            parts   = proj_wf.split("/", 1)
+            proj    = parts[0] if len(parts) > 0 else ""
+            wf      = parts[1] if len(parts) > 1 else ""
+            aid     = first_aid
+            att_url = f"{s.base_url}/attempts/{aid}" if aid else s.url
+            s.attempts = [AttemptInfo(
+                attempt_id=aid, attempt_url=att_url,
+                project=proj, workflow=wf,
+            )]
+        else:
+            # Multiple attempts — no individual attempt ids from list_server
+            # Build one AttemptInfo per running entry (no attempt URL)
+            s.attempts = []
+            for proj_wf in s.running:
+                parts = proj_wf.split("/", 1)
+                proj  = parts[0] if len(parts) > 0 else ""
+                wf    = parts[1] if len(parts) > 1 else ""
+                s.attempts.append(AttemptInfo(
+                    attempt_id="", attempt_url="",
+                    project=proj, workflow=wf,
+                ))
+
     import sys
     if DEBUG:
         print(f"[DEBUG] _parse_list_server: {len(servers)} server(s) parsed", file=sys.stderr)
         for s in servers:
-            print(f"  → no={s.no} pid={s.pid} port={s.port} url={s.url} running={s.running}", file=sys.stderr)
+            print(f"  → no={s.no} pid={s.pid} port={s.port} url={s.url} running={s.running} attempts={len(s.attempts)}", file=sys.stderr)
     return servers
 
 
@@ -789,60 +841,95 @@ function renderTable(list) {
     </tr>`;
 
     group.forEach((s, i) => {
-      const hasRunning = s.running.length > 0;
-      const runHtml = hasRunning
-        ? s.running.map(r =>
-            `<span style="display:inline-block;background:rgba(63,185,80,.12);
-             color:var(--green);border:1px solid rgba(63,185,80,.25);
-             border-radius:4px;padding:1px 8px;font-size:11px;
-             font-family:'JetBrains Mono',monospace;margin:2px 2px 2px 0;">
-             ${r}</span>`
-          ).join("")
-        : `<span style="color:var(--muted);font-size:12px;">(idle)</span>`;
-
-      // Kill button: only active for own servers
-      // Fallback: if owner field is empty, treat as own server
       const serverOwner = s.owner || s.user || viewer;
-      const isMine = serverOwner === viewer;
-      const killBtn = isMine
-        ? `<button class="btn btn-red" style="font-size:11px;padding:3px 10px;"
+      const isMine  = serverOwner === viewer;
+      const baseUrl = s.base_url || s.url;
+
+      // Kill server button (one per server row)
+      const killServerBtn = isMine
+        ? `<button class="btn btn-red" style="font-size:11px;padding:3px 8px;"
              onclick="confirmKill('${s.pid}','${s.port}','${serverOwner}')">
              🗡 Kill
            </button>`
-        : `<button class="btn btn-gray" style="font-size:11px;padding:3px 10px;
-             opacity:.35;cursor:not-allowed;" disabled title="Owned by ${serverOwner}">
-             🗡 Kill
-           </button>`;
+        : `<button class="btn btn-gray" style="font-size:11px;padding:3px 8px;
+             opacity:.35;cursor:not-allowed;" disabled
+             title="Owned by ${serverOwner}">🗡 Kill</button>`;
 
-      rows += `
-      <tr class="fade-in" style="animation-delay:${i * 40}ms;
-        ${isMe ? "" : "opacity:.75;"}">
-        <td class="mono" style="color:var(--muted);font-size:12px;">${s.no}</td>
-        <td class="mono" style="font-weight:700;font-size:13px;">${s.pid}</td>
-        <td>
-          <span style="background:rgba(227,179,65,.1);color:var(--amber);
+      const attempts = s.attempts || [];
+
+      if (attempts.length === 0) {
+        // ── No attempts: single row, server URL only ──────────
+        rows += `
+        <tr class="fade-in" style="${isMine ? "" : "opacity:.8;"}">
+          <td class="mono" style="color:var(--muted);font-size:12px;">${s.no}</td>
+          <td class="mono" style="font-weight:700;font-size:13px;">${s.pid}</td>
+          <td><span style="background:rgba(227,179,65,.1);color:var(--amber);
             border:1px solid rgba(227,179,65,.2);border-radius:4px;
             padding:2px 8px;font-size:12px;font-family:'JetBrains Mono',monospace;">
-            ${s.port}
-          </span>
-        </td>
-        <td class="mono" style="font-size:11px;color:var(--muted);">
-          <a href="${s.url}" target="_blank"
-             style="color:var(--blue);text-decoration:none;"
-             onmouseover="this.style.textDecoration='underline'"
-             onmouseout="this.style.textDecoration='none'">
-            ${s.url}
-          </a>
-        </td>
-        <td>${runHtml}</td>
-        <td style="text-align:center;white-space:nowrap;">
-          <button class="btn btn-gray" style="font-size:11px;padding:3px 10px;margin-right:4px;"
-                  onclick="window.open('${s.url}','_blank')">
-            🌐 Open
-          </button>
-          ${killBtn}
-        </td>
-      </tr>`;
+            ${s.port}</span></td>
+          <td class="mono" style="font-size:11px;">
+            <a href="${baseUrl}" target="_blank"
+               style="color:var(--muted);text-decoration:none;"
+               onmouseover="this.style.textDecoration='underline'"
+               onmouseout="this.style.textDecoration='none'">${baseUrl}</a>
+          </td>
+          <td style="color:var(--muted);font-size:12px;">(idle)</td>
+          <td style="text-align:center;white-space:nowrap;">
+            <button class="btn btn-gray" style="font-size:11px;padding:3px 8px;margin-right:4px;"
+                    onclick="window.open('${baseUrl}','_blank')">🌐 Open</button>
+            ${killServerBtn}
+          </td>
+        </tr>`;
+
+      } else {
+        // ── Has attempts: one row per attempt ─────────────────
+        attempts.forEach((att, ai) => {
+          const attUrl = att.attempt_url || baseUrl;
+          const dispUrl = att.attempt_id
+            ? attUrl                         // /attempts/{id}
+            : baseUrl;                       // no id — show base url
+          const projWf  = [att.project, att.workflow].filter(Boolean).join("/");
+
+          const runBadge = projWf
+            ? `<span style="display:inline-block;background:rgba(63,185,80,.12);
+                color:var(--green);border:1px solid rgba(63,185,80,.25);
+                border-radius:4px;padding:1px 8px;font-size:11px;
+                font-family:'JetBrains Mono',monospace;">${projWf}</span>`
+            : `<span style="color:var(--muted);font-size:12px;">(running)</span>`;
+
+          // Port + Kill button only on first attempt row
+          const portCell = ai === 0
+            ? `<span style="background:rgba(227,179,65,.1);color:var(--amber);
+                border:1px solid rgba(227,179,65,.2);border-radius:4px;
+                padding:2px 8px;font-size:12px;font-family:'JetBrains Mono',monospace;">
+                ${s.port}</span>`
+            : "";
+          const pidCell  = ai === 0 ? s.pid  : "";
+          const noCell   = ai === 0 ? s.no   : "";
+          const actionCell = ai === 0
+            ? `<button class="btn btn-gray" style="font-size:11px;padding:3px 8px;margin-right:4px;"
+                       onclick="window.open('${attUrl}','_blank')">🌐 Open</button>
+               ${killServerBtn}`
+            : `<button class="btn btn-gray" style="font-size:11px;padding:3px 8px;"
+                       onclick="window.open('${attUrl}','_blank')">🌐 Open</button>`;
+
+          rows += `
+          <tr class="fade-in" style="${isMine ? "" : "opacity:.8;"}
+            ${ai > 0 ? "border-top:none;" : ""}">
+            <td class="mono" style="color:var(--muted);font-size:12px;">${noCell}</td>
+            <td class="mono" style="font-weight:700;font-size:13px;">${pidCell}</td>
+            <td>${portCell}</td>
+            <td class="mono" style="font-size:11px;">
+              <a href="${dispUrl}" target="_blank"
+                 style="color:var(--blue);text-decoration:none;"
+                 onmouseover="this.style.textDecoration='underline'"
+                 onmouseout="this.style.textDecoration='none'">${dispUrl}</a>
+            </td>
+            <td>${runBadge}</td>
+            <td style="text-align:center;white-space:nowrap;">${actionCell}</td>
+          </tr>`;
+        });
+      }
     });
   });
 
