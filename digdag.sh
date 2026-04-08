@@ -457,13 +457,15 @@ cmd_run_workflow() {
     local params_file=""       # -P / --params-file (optional)
     local once=false           # --once: disposable (new server -> push -> start -> shutdown)
     local log_file=""          # --log <file>: background monitoring log file (--once only)
-    local log_file=""          # --log <file>: background monitoring log file (--once only)
+    local parent_project=""    # --parent: parent project  (--once only)
+    local parent_workflow=""   # --parent: parent workflow (--once only)
 
     # Security 4: Strict option parsing - reject unknown options
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --once) once=true; shift ;;
             --log|-L) log_file="$2"; shift 2 ;;
+            --parent) parent_project="$2"; parent_workflow="$3"; shift 3 ;;
             --project|-d)
                 project_dir="$2"; shift 2 ;;
             --params-file|-P)
@@ -488,6 +490,18 @@ cmd_run_workflow() {
         has_error=true
     fi
 
+    # --parent is only valid with --once
+    if [ -n "$parent_project" ] && ! $once; then
+        log "${RED}[ERROR] --parent option requires --once.${NC}"
+        has_error=true
+    fi
+    # --parent requires both parent_project and parent_workflow
+    if $once && { [ -n "$parent_project" ] && [ -z "$parent_workflow" ]; } || \
+               { [ -z "$parent_project" ] && [ -n "$parent_workflow" ]; }; then
+        log "${RED}[ERROR] --parent requires both <parent_project> and <parent_workflow>.${NC}"
+        has_error=true
+    fi
+
     # Check params-file exists if specified
     if [ -n "$params_file" ] && [ ! -f "$params_file" ]; then
         log "${RED}[ERROR] --params-file not found: $params_file${NC}"
@@ -506,6 +520,8 @@ cmd_run_workflow() {
         log "  --project, -d <dir>      : Project directory (default: current directory)"
         log "  --params-file, -P <file> : External parameter file path"
         log "  --once                   : Disposable server (new server -> push -> start -> bg wait -> server stop)
+  --parent <proj> <wf>     : --once only. Reuse the server running <proj>/<wf> as parent.
+                             If not found, warns and boots a new --once server.
   --log, -L <file>         : --once only. Background monitoring log file path"
         log ""
         log "  Example) digdag run_workflow my_project etl_workflow"
@@ -517,7 +533,9 @@ cmd_run_workflow() {
 
     # Server mode label
     local mode_str
-    if $once; then
+    if $once && [ -n "$parent_project" ]; then
+        mode_str="Disposable server (--once --parent ${parent_project}/${parent_workflow})"
+    elif $once; then
         mode_str="Disposable server (--once: new server -> auto shutdown after completion)"
     else
         mode_str="Reuse existing server or start new one"
@@ -542,20 +560,53 @@ cmd_run_workflow() {
     if ! $once && port=$(check_server_alive); then
         log "${GREEN}[OK] Reusing existing server (PORT: $port)${NC}"
     else
-        if $once; then
+        if $once && [ -n "$parent_project" ]; then
+            # --parent: find server running parent_project/parent_workflow
+            log "  [INFO] --parent: searching for server running ${parent_project}/${parent_workflow}..."
+            local _found_parent=false
+            local _all_pids
+            _all_pids=$(find_my_digdag_server_pid)
+            while IFS= read -r _pid || [ -n "$_pid" ]; do
+                [ -z "$_pid" ] && continue
+                local _p
+                _p=$(find_port_by_pid "$_pid") || continue
+                port_in_use "$_p" || continue
+                # Check if parent_project/parent_workflow is running on this server
+                local _ep="http://$HOST_NAME:$_p"
+                local _attempts_raw _blocks _running_ids
+                fetch_attempts "$parent_project" "$parent_workflow" "$_ep" "running"
+                if [ $? -eq 0 ] && [ -n "$_running_ids" ]; then
+                    port="$_p"
+                    _found_parent=true
+                    log "${GREEN}[OK] Parent server found (PORT: $port, running ${parent_project}/${parent_workflow})${NC}"
+                    break
+                fi
+            done <<< "$_all_pids"
+
+            if ! $_found_parent; then
+                log "${YELLOW}[WARN] Parent server not found (${parent_project}/${parent_workflow} not running).${NC}"
+                log "  Booting new --once server instead."
+                if ! port=$(start_once_server); then
+                    log "${RED}[ERROR] Disposable server boot failed. Aborting run_workflow.${NC}"
+                    exit 1
+                fi
+                server_booted=true
+            fi
+        elif $once; then
             log "  [INFO] --once: booting dedicated disposable server."
             if ! port=$(start_once_server); then
                 log "${RED}[ERROR] Disposable server boot failed. Aborting run_workflow.${NC}"
                 exit 1
             fi
+            server_booted=true
         else
             log "  No server found -> auto-booting."
             if ! port=$(start_server); then
                 log "${RED}[ERROR] Server boot failed. Aborting run_workflow.${NC}"
                 exit 1
             fi
+            server_booted=true
         fi
-        server_booted=true
         log "${GREEN}[OK] Server ready (PORT: $port)${NC}"
     fi
 
