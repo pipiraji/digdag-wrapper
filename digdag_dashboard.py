@@ -30,7 +30,7 @@ import json
 import os
 import re
 import subprocess
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
 
@@ -72,24 +72,74 @@ for _d in (DIGDAG_TMP_DIR, DASHBOARD_DIR):
 # ══════════════════════════════════════════════════════════════
 @dataclass
 class AttemptInfo:
-    """Single running attempt on a server."""
-    attempt_id:  str   # numeric id
-    attempt_url: str   # http://host:port/attempts/{id}
+    """A single attempt returned from /api/attempts."""
+    id:          str
     project:     str
     workflow:    str
+    status:      str   # running / success / error / killed
+    created_at:  str
+    finished_at: str
+
+    @property
+    def url(self) -> str:
+        return ""   # filled in by ServerInfo.attempt_url()
 
 
 @dataclass
 class ServerInfo:
-    no:       str
     pid:      str
     port:     str
-    url:      str       # base server URL (or /attempts/N if single running)
-    user:     str       # OS user who owns the process
-    running:  list = field(default_factory=list)   # ["proj/wf", ...]
-    owner:    str  = ""
+    user:     str          # OS user who owns this server
+    owner:    str  = ""    # same as user; for frontend permission check
     attempts: list = field(default_factory=list)   # list[AttemptInfo]
-    base_url: str  = ""  # always http://host:port (without /attempts/N)
+
+    @property
+    def base_url(self) -> str:
+        return f"http://{HOSTNAME}:{self.port}"
+
+    def attempt_url(self, attempt_id: str) -> str:
+        return f"{self.base_url}/attempts/{attempt_id}"
+
+    @property
+    def running_attempts(self) -> list:
+        return [a for a in self.attempts if a.status == "running"]
+
+    def to_dict(self) -> dict:
+        """Custom serialization for JSON (replaces asdict for nested objects)."""
+        base = self.base_url
+        running = self.running_attempts
+        return {
+            "pid":      self.pid,
+            "port":     self.port,
+            "user":     self.user,
+            "owner":    self.owner or self.user,
+            "base_url": base,
+            # URL logic:
+            #   0 running → base URL
+            #   1 running → /attempts/{id}
+            #   2+ running → base URL
+            "url": (
+                self.attempt_url(running[0].id)
+                if len(running) == 1
+                else base
+            ),
+            "running": [
+                f"{a.project}/{a.workflow}"
+                for a in running
+            ],
+            "attempts": [
+                {
+                    "id":          a.id,
+                    "project":     a.project,
+                    "workflow":    a.workflow,
+                    "status":      a.status,
+                    "created_at":  a.created_at,
+                    "finished_at": a.finished_at,
+                    "url":         self.attempt_url(a.id),
+                }
+                for a in self.attempts
+            ],
+        }
 
 
 # ══════════════════════════════════════════════════════════════
@@ -103,177 +153,168 @@ _ROW  = re.compile(
 )
 
 
-def _parse_list_server(raw: str, user: str) -> list[ServerInfo]:
-    servers: list[ServerInfo] = []
-    current: Optional[ServerInfo] = None
-
-    for line in raw.splitlines():
-        line = _ANSI.sub("", line).strip()
-        m = _ROW.match(line)
-        if not m:
-            continue
-
-        no_v   = m.group("no").strip()
-        pid_v  = m.group("pid").strip()
-        port_v = m.group("port").strip()
-        url_v  = m.group("url").strip()   # keep URL as-is from list_server
-        run_v  = m.group("run").strip()
-
-        if no_v.lower() in ("no.", "no") or pid_v.lower() == "pid":
-            continue
-
-        if no_v:
-            # Extract base URL (strip /attempts/N if present)
-            import re as _re
-            base_url_v = _re.sub(r"/attempts/\d+.*$", "", url_v)
-            # Extract attempt id from URL if present
-            _aid_m = _re.search(r"/attempts/(\d+)", url_v)
-            _attempt_id = _aid_m.group(1) if _aid_m else ""
-            current = ServerInfo(no=no_v, pid=pid_v, port=port_v,
-                                 url=url_v, user=user, running=[], owner=user,
-                                 attempts=[], base_url=base_url_v)
-            # Store first attempt id (from URL) — running list will add more
-            current._first_aid = _attempt_id
-            servers.append(current)
-            if run_v and run_v not in ("(none)", "(없음)"):
-                current.running.append(run_v)
-        elif current and run_v and run_v != "(none)":
-            current.running.append(run_v)
-
-    # Build AttemptInfo list for each server
+def _find_digdag_server_pids() -> list[str]:
+    """
+    Find PIDs of 'digdag server' processes owned by the current user.
+    Mirrors digdag.sh find_my_digdag_server_pid().
+    """
     import re as _re
-    for s in servers:
-        first_aid = getattr(s, "_first_aid", "")
-        if len(s.running) == 0:
-            # No running attempts
-            s.attempts = []
-        elif len(s.running) == 1:
-            # Single attempt — attempt id may be in URL
-            proj_wf = s.running[0]
-            parts   = proj_wf.split("/", 1)
-            proj    = parts[0] if len(parts) > 0 else ""
-            wf      = parts[1] if len(parts) > 1 else ""
-            aid     = first_aid
-            att_url = f"{s.base_url}/attempts/{aid}" if aid else s.url
-            s.attempts = [AttemptInfo(
-                attempt_id=aid, attempt_url=att_url,
-                project=proj, workflow=wf,
-            )]
-        else:
-            # Multiple attempts — no individual attempt ids from list_server
-            # Build one AttemptInfo per running entry (no attempt URL)
-            s.attempts = []
-            for proj_wf in s.running:
-                parts = proj_wf.split("/", 1)
-                proj  = parts[0] if len(parts) > 0 else ""
-                wf    = parts[1] if len(parts) > 1 else ""
-                s.attempts.append(AttemptInfo(
-                    attempt_id="", attempt_url="",
-                    project=proj, workflow=wf,
-                ))
-
-    import sys
-    if DEBUG:
-        print(f"[DEBUG] _parse_list_server: {len(servers)} server(s) parsed", file=sys.stderr)
-        for s in servers:
-            print(f"  → no={s.no} pid={s.pid} port={s.port} url={s.url} running={s.running} attempts={len(s.attempts)}", file=sys.stderr)
-    return servers
-
-
-def _run_list_server_as(user: str) -> list[ServerInfo]:
-    """
-    Run 'digdag list_server' as the given user.
-    If the current process IS that user, run directly.
-    Otherwise use 'su -c'.
-    """
-    current_user = getpass.getuser()
-
-    if user == current_user:
-        cmd = [DIGDAG_SH, "list_server"]
-    else:
-        cmd = ["su", "-", user, "-c", f"{DIGDAG_SH} list_server"]
-
+    jar_name = os.path.basename(DIGDAG_SH)   # use script name as filter key
     try:
-        import sys
-        if DEBUG:
-            print(f"\n[DEBUG] cmd = {cmd}", file=sys.stderr)
-
-        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                           text=True, timeout=20)
-
-        if DEBUG:
-            print(f"[DEBUG] returncode = {r.returncode}", file=sys.stderr)
-            print(f"[DEBUG] stdout ({len(r.stdout)} bytes):\n{r.stdout[:800]}", file=sys.stderr)
-            print(f"[DEBUG] stderr ({len(r.stderr)} bytes):\n{r.stderr[:800]}", file=sys.stderr)
-
-        raw = r.stderr or r.stdout
-
-        no_server_patterns = [
-            "No running Digdag server found",
-            "기동 중인 Digdag 서버가 없습니다",
-        ]
-        if not raw.strip():
-            if DEBUG:
-                print("[DEBUG] raw output is EMPTY → returning []", file=sys.stderr)
-            return []
-        if any(p in raw for p in no_server_patterns):
-            if DEBUG:
-                print(f"[DEBUG] matched no-server pattern → returning []", file=sys.stderr)
-            return []
-
-        servers = _parse_list_server(raw, user)
-        if DEBUG:
-            print(f"[DEBUG] parsed {len(servers)} server(s): {[s.pid for s in servers]}", file=sys.stderr)
-        return servers
-
-    except Exception as e:
-        import sys
-        print(f"[ERROR] list_server failed for user={user!r}: {e}", file=sys.stderr)
+        out = subprocess.check_output(
+            ["ps", "-u", _USER, "-f"],
+            text=True, stderr=subprocess.DEVNULL,
+        )
+    except subprocess.CalledProcessError:
         return []
 
+    skip = {"run", "push", "start", "retry", "kill", "check"}
+    pids = []
+    for line in out.splitlines():
+        # Match lines containing the digdag script and "server" subcommand
+        if DIGDAG_SH in line and "server" in line:
+            if not any(k in line for k in skip):
+                parts = line.split()
+                if len(parts) >= 2:
+                    pids.append(parts[1])
+    return pids
 
-def fetch_all_servers(username: str) -> list[ServerInfo]:
+
+def _find_port_by_pid(pid: str) -> Optional[str]:
     """
-    Collect digdag servers from ALL users on the machine.
-    Each ServerInfo carries an 'owner' field.
-    'username' is the connected browser user (used to mark own servers).
+    Find listening port for a given PID.
+    Strategy (mirrors digdag.sh find_port_by_pid):
+      1. Check /tmp/digdag_<user>/server.info
+      2. Check /tmp/digdag_<user>/once.*/server.info
+      3. Fallback: ss -tlnp
     """
-    all_users = _find_digdag_users()
-    result: list[ServerInfo] = []
-    for user in all_users:
-        result.extend(_run_list_server_as(user))
+    # 1. start_server info file
+    info_file = f"{DIGDAG_TMP_DIR}/server.info"
+    if os.path.isfile(info_file):
+        try:
+            info = dict(
+                line.split("=", 1)
+                for line in open(info_file).read().splitlines()
+                if "=" in line
+            )
+            if info.get("PID") == pid:
+                return info.get("PORT")
+        except Exception:
+            pass
+
+    # 2. --once server.info files
+    try:
+        import glob
+        for once_info in glob.glob(f"{DIGDAG_TMP_DIR}/once.*/server.info"):
+            info = dict(
+                line.split("=", 1)
+                for line in open(once_info).read().splitlines()
+                if "=" in line
+            )
+            if info.get("PID") == pid:
+                return info.get("PORT")
+    except Exception:
+        pass
+
+    # 3. Fallback: ss -tlnp
+    try:
+        out = subprocess.check_output(
+            ["ss", "-tlnp"],
+            text=True, stderr=subprocess.DEVNULL,
+        )
+        for line in out.splitlines():
+            if f"pid={pid}," in line:
+                parts = line.split()
+                for part in parts:
+                    if ":" in part:
+                        port = part.rsplit(":", 1)[-1]
+                        if port.isdigit():
+                            return port
+    except Exception:
+        pass
+
+    return None
+
+
+# ══════════════════════════════════════════════════════════════
+#  Digdag REST API client
+# ══════════════════════════════════════════════════════════════
+
+def _api_get(base_url: str, path: str, timeout: int = 8) -> Optional[object]:
+    """GET {base_url}{path} → parsed JSON or None."""
+    import urllib.request, urllib.error
+    req = urllib.request.Request(
+        f"{base_url}{path}",
+        headers={"Accept": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode())
+    except Exception:
+        return None
+
+
+def _fetch_attempts_from_api(base_url: str) -> list[AttemptInfo]:
+    """
+    GET /api/attempts?pageSize=100
+    Returns all attempts (all statuses) for this server.
+    """
+    data = _api_get(base_url, "/api/attempts?pageSize=100")
+    if not data:
+        return []
+
+    raw_list = data if isinstance(data, list) else data.get("attempts", [])
+    result = []
+    for a in raw_list:
+        result.append(AttemptInfo(
+            id          = str(a.get("id", "")),
+            project     = a.get("project", {}).get("name", ""),
+            workflow    = a.get("workflow", {}).get("name", ""),
+            status      = a.get("status", ""),
+            created_at  = (a.get("createdAt")  or "")[:19].replace("T", " "),
+            finished_at = (a.get("finishedAt") or "")[:19].replace("T", " "),
+        ))
     return result
 
 
-def _find_digdag_users() -> list[str]:
-    """Find all OS users currently running a digdag server process."""
-    users: set[str] = set()
-    try:
-        out = subprocess.check_output(
-            ["ps", "-eo", "user,args", "--no-headers"],
-            text=True, stderr=subprocess.DEVNULL,
-        )
-        jar = os.path.basename(
-            "/user/qarepo/usr/local/digdag-0.10.5.1.jar"
-        )
-        for line in out.splitlines():
-            parts = line.split(None, 1)
-            if len(parts) == 2:
-                user, args = parts
-                if ("server" in args
-                        and not any(k in args for k in
-                                    ("run","push","start","retry","kill","check"))):
-                    users.add(user)
-    except Exception:
-        pass
-    # Always include current user even if no server running yet
-    users.add(getpass.getuser())
-    return sorted(users)
+# ══════════════════════════════════════════════════════════════
+#  Main data collector
+# ══════════════════════════════════════════════════════════════
+
+def fetch_all_servers(username: str = "") -> list[ServerInfo]:
+    """
+    1. Find digdag server PIDs via ps
+    2. Resolve port via server.info / ss
+    3. Call /api/attempts for each server
+    Returns list[ServerInfo] with full attempt data.
+    """
+    pids = _find_digdag_server_pids()
+    result: list[ServerInfo] = []
+
+    for pid in pids:
+        port = _find_port_by_pid(pid)
+        if not port:
+            continue
+
+        srv = ServerInfo(pid=pid, port=port, user=_USER, owner=_USER)
+
+        # Fetch all attempts from REST API
+        srv.attempts = _fetch_attempts_from_api(srv.base_url)
+
+        if DEBUG:
+            import sys
+            print(
+                f"[DEBUG] pid={pid} port={port} "
+                f"attempts={len(srv.attempts)} "
+                f"running={len(srv.running_attempts)}",
+                file=sys.stderr,
+            )
+
+        result.append(srv)
+
+    return result
 
 
-# ══════════════════════════════════════════════════════════════
-#  Kill
-# ══════════════════════════════════════════════════════════════
 def kill_server(pid: str) -> dict:
     try:
         subprocess.run(["kill", "--", f"-{pid}"],
@@ -336,7 +377,7 @@ async def scanner_loop():
         all_servers = await asyncio.get_event_loop().run_in_executor(
             None, fetch_all_servers, ""
         )
-        payload_servers = [asdict(s) for s in all_servers]
+        payload_servers = [s.to_dict() for s in all_servers]
         ts = datetime.now().strftime("%H:%M:%S")
 
         # Send same server list to every connected session
@@ -421,25 +462,24 @@ async def debug_endpoint(username: str):
     lines.append(f"CMD: {' '.join(cmd)}")
     lines.append("")
 
-    try:
-        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                           text=True, timeout=20)
-        lines.append(f"returncode : {r.returncode}")
-        lines.append(f"--- stdout ({len(r.stdout)} bytes) ---")
-        lines.append(r.stdout or "(empty)")
-        lines.append(f"--- stderr ({len(r.stderr)} bytes) ---")
-        lines.append(r.stderr or "(empty)")
+    # Find servers via ps/ss
+    pids = _find_digdag_server_pids()
+    lines.append(f"Found PIDs: {pids}")
+    lines.append("")
+
+    for pid in pids:
+        port = _find_port_by_pid(pid)
+        lines.append(f"PID={pid}  PORT={port or '(not found)'}")
+        if port:
+            base_url = f"http://{HOSTNAME}:{port}"
+            attempts = _fetch_attempts_from_api(base_url)
+            lines.append(f"  /api/attempts → {len(attempts)} attempt(s)")
+            for a in attempts:
+                lines.append(
+                    f"    id={a.id:>6}  [{a.status:<10}]  "
+                    f"{a.project}/{a.workflow}"
+                )
         lines.append("")
-
-        raw = r.stderr or r.stdout
-        servers = _parse_list_server(raw, username)
-        lines.append(f"=== Parsed result: {len(servers)} server(s) ===")
-        for s in servers:
-            lines.append(f"  no={s.no} pid={s.pid} port={s.port} url={s.url}")
-            lines.append(f"  running={s.running}")
-    except Exception as e:
-        lines.append(f"EXCEPTION: {e}")
-
     return PlainTextResponse("\n".join(lines))
 
 
@@ -460,7 +500,7 @@ async def websocket_endpoint(ws: WebSocket):
     await ws.send_json({
         "type":      "update",
         "timestamp": datetime.now().strftime("%H:%M:%S"),
-        "servers":   [asdict(s) for s in servers],
+        "servers":   [s.to_dict() for s in servers],
         "viewer":    username,
     })
     try:
@@ -490,7 +530,7 @@ async def websocket_endpoint(ws: WebSocket):
                 await ws.send_json({
                     "type":      "update",
                     "timestamp": datetime.now().strftime("%H:%M:%S"),
-                    "servers":   [asdict(s) for s in servers],
+                    "servers":   [s.to_dict() for s in servers],
                 })
     except WebSocketDisconnect:
         sessions.disconnect(username, ws)
@@ -805,68 +845,72 @@ function renderTable(list) {
   const tbody = document.getElementById("server-tbody");
 
   if (!list.length) {
-    tbody.innerHTML = `<tr><td colspan="7"
+    tbody.innerHTML = `<tr><td colspan="6"
       style="text-align:center;color:var(--muted);padding:40px;font-size:14px;">
       No running Digdag servers found.</td></tr>`;
     document.getElementById("kill-all-btn").style.display = "none";
     return;
   }
 
-  // Show Kill All only if viewer owns at least one server
-  const myServers = list.filter(s => s.owner === viewer);
+  const myServers = list.filter(s => (s.owner || s.user) === viewer);
   document.getElementById("kill-all-btn").style.display =
     myServers.length ? "inline-flex" : "none";
 
-  // Group by owner for visual separation
-  const ownerOrder = [...new Set(list.map(s => s.owner))].sort(o =>
-    o === viewer ? -1 : 1
+  // Section order: own servers first
+  const ownerOrder = [...new Set(list.map(s => s.owner || s.user))].sort(
+    o => o === viewer ? -1 : 1
   );
 
   let rows = "";
+
   ownerOrder.forEach(owner => {
-    const group = list.filter(s => s.owner === owner);
-    const isMe  = owner === viewer;   // for section header
+    const group = list.filter(s => (s.owner || s.user) === owner);
+    const isMe  = owner === viewer;
 
     // Owner section header
     rows += `
     <tr>
-      <td colspan="7" style="
+      <td colspan="6" style="
         background:${isMe ? "rgba(63,185,80,.06)" : "rgba(255,255,255,.02)"};
-        padding:6px 14px; border-bottom:1px solid var(--border);">
+        padding:5px 14px; border-bottom:1px solid var(--border);">
         <span style="font-size:11px; font-family:'JetBrains Mono',monospace;
           color:${isMe ? "var(--green)" : "var(--muted)"};">
-          ${isMe ? "▶ " : "  "}${owner}${isMe ? "  (you)" : "  (read-only)"}
+          ${isMe ? "▶" : "  "} ${owner}${isMe ? "  (you)" : "  (read-only)"}
         </span>
       </td>
     </tr>`;
 
-    group.forEach((s, i) => {
+    group.forEach(s => {
       const serverOwner = s.owner || s.user || viewer;
-      const isMine  = serverOwner === viewer;
-      const baseUrl = s.base_url || s.url;
+      const baseUrl     = s.base_url || s.url;
 
-      // Kill server button (one per server row)
-      const killServerBtn = isMine
-        ? `<button class="btn btn-red" style="font-size:11px;padding:3px 8px;"
+      // ── Kill server button ────────────────────────────────
+      const killBtn = isMe
+        ? `<button class="btn btn-red"
+             style="font-size:11px;padding:3px 8px;"
              onclick="confirmKill('${s.pid}','${s.port}','${serverOwner}')">
              🗡 Kill
            </button>`
-        : `<button class="btn btn-gray" style="font-size:11px;padding:3px 8px;
-             opacity:.35;cursor:not-allowed;" disabled
-             title="Owned by ${serverOwner}">🗡 Kill</button>`;
+        : `<button class="btn btn-gray"
+             style="font-size:11px;padding:3px 8px;opacity:.35;cursor:not-allowed;"
+             disabled title="Owned by ${serverOwner}">🗡 Kill</button>`;
 
-      const attempts = s.attempts || [];
+      // ── Port badge (shared across rows) ───────────────────
+      const portBadge = `
+        <span style="background:rgba(227,179,65,.1);color:var(--amber);
+          border:1px solid rgba(227,179,65,.2);border-radius:4px;
+          padding:2px 8px;font-size:12px;
+          font-family:'JetBrains Mono',monospace;">${s.port}</span>`;
 
-      if (attempts.length === 0) {
-        // ── No attempts: single row, server URL only ──────────
+      const runCount = (s.running || []).length;
+
+      if (runCount === 0) {
+        // ── No attempts: 1 row, server base URL, (idle) ──────
         rows += `
-        <tr class="fade-in" style="${isMine ? "" : "opacity:.8;"}">
+        <tr class="fade-in" style="${isMe ? "" : "opacity:.8;"}">
           <td class="mono" style="color:var(--muted);font-size:12px;">${s.no}</td>
           <td class="mono" style="font-weight:700;font-size:13px;">${s.pid}</td>
-          <td><span style="background:rgba(227,179,65,.1);color:var(--amber);
-            border:1px solid rgba(227,179,65,.2);border-radius:4px;
-            padding:2px 8px;font-size:12px;font-family:'JetBrains Mono',monospace;">
-            ${s.port}</span></td>
+          <td>${portBadge}</td>
           <td class="mono" style="font-size:11px;">
             <a href="${baseUrl}" target="_blank"
                style="color:var(--muted);text-decoration:none;"
@@ -875,60 +919,72 @@ function renderTable(list) {
           </td>
           <td style="color:var(--muted);font-size:12px;">(idle)</td>
           <td style="text-align:center;white-space:nowrap;">
-            <button class="btn btn-gray" style="font-size:11px;padding:3px 8px;margin-right:4px;"
-                    onclick="window.open('${baseUrl}','_blank')">🌐 Open</button>
-            ${killServerBtn}
+            <button class="btn btn-gray"
+              style="font-size:11px;padding:3px 8px;margin-right:4px;"
+              onclick="window.open('${baseUrl}','_blank')">🌐 Open</button>
+            ${killBtn}
+          </td>
+        </tr>`;
+
+      } else if (runCount === 1) {
+        // ── 1 attempt: 1 row, /attempts/{id} URL, proj/wf badge
+        const projWf  = s.running[0];
+        const dispUrl = s.url;   // already has /attempts/{id} from list_server
+        const badge   = `<span style="display:inline-block;
+          background:rgba(63,185,80,.12);color:var(--green);
+          border:1px solid rgba(63,185,80,.25);border-radius:4px;
+          padding:1px 8px;font-size:11px;
+          font-family:'JetBrains Mono',monospace;">${projWf}</span>`;
+
+        rows += `
+        <tr class="fade-in" style="${isMe ? "" : "opacity:.8;"}">
+          <td class="mono" style="color:var(--muted);font-size:12px;">${s.no}</td>
+          <td class="mono" style="font-weight:700;font-size:13px;">${s.pid}</td>
+          <td>${portBadge}</td>
+          <td class="mono" style="font-size:11px;">
+            <a href="${dispUrl}" target="_blank"
+               style="color:var(--blue);text-decoration:none;"
+               onmouseover="this.style.textDecoration='underline'"
+               onmouseout="this.style.textDecoration='none'">${dispUrl}</a>
+          </td>
+          <td>${badge}</td>
+          <td style="text-align:center;white-space:nowrap;">
+            <button class="btn btn-gray"
+              style="font-size:11px;padding:3px 8px;margin-right:4px;"
+              onclick="window.open('${dispUrl}','_blank')">🌐 Open</button>
+            ${killBtn}
           </td>
         </tr>`;
 
       } else {
-        // ── Has attempts: one row per attempt ─────────────────
-        attempts.forEach((att, ai) => {
-          const attUrl = att.attempt_url || baseUrl;
-          const dispUrl = att.attempt_id
-            ? attUrl                         // /attempts/{id}
-            : baseUrl;                       // no id — show base url
-          const projWf  = [att.project, att.workflow].filter(Boolean).join("/");
+        // ── 2+ attempts: 1 row, base URL, all proj/wf badges ─
+        const badges = s.running.map(r =>
+          `<span style="display:inline-block;
+            background:rgba(63,185,80,.12);color:var(--green);
+            border:1px solid rgba(63,185,80,.25);border-radius:4px;
+            padding:1px 8px;font-size:11px;margin:2px 2px 2px 0;
+            font-family:'JetBrains Mono',monospace;">${r}</span>`
+        ).join("");
 
-          const runBadge = projWf
-            ? `<span style="display:inline-block;background:rgba(63,185,80,.12);
-                color:var(--green);border:1px solid rgba(63,185,80,.25);
-                border-radius:4px;padding:1px 8px;font-size:11px;
-                font-family:'JetBrains Mono',monospace;">${projWf}</span>`
-            : `<span style="color:var(--muted);font-size:12px;">(running)</span>`;
-
-          // Port + Kill button only on first attempt row
-          const portCell = ai === 0
-            ? `<span style="background:rgba(227,179,65,.1);color:var(--amber);
-                border:1px solid rgba(227,179,65,.2);border-radius:4px;
-                padding:2px 8px;font-size:12px;font-family:'JetBrains Mono',monospace;">
-                ${s.port}</span>`
-            : "";
-          const pidCell  = ai === 0 ? s.pid  : "";
-          const noCell   = ai === 0 ? s.no   : "";
-          const actionCell = ai === 0
-            ? `<button class="btn btn-gray" style="font-size:11px;padding:3px 8px;margin-right:4px;"
-                       onclick="window.open('${attUrl}','_blank')">🌐 Open</button>
-               ${killServerBtn}`
-            : `<button class="btn btn-gray" style="font-size:11px;padding:3px 8px;"
-                       onclick="window.open('${attUrl}','_blank')">🌐 Open</button>`;
-
-          rows += `
-          <tr class="fade-in" style="${isMine ? "" : "opacity:.8;"}
-            ${ai > 0 ? "border-top:none;" : ""}">
-            <td class="mono" style="color:var(--muted);font-size:12px;">${noCell}</td>
-            <td class="mono" style="font-weight:700;font-size:13px;">${pidCell}</td>
-            <td>${portCell}</td>
-            <td class="mono" style="font-size:11px;">
-              <a href="${dispUrl}" target="_blank"
-                 style="color:var(--blue);text-decoration:none;"
-                 onmouseover="this.style.textDecoration='underline'"
-                 onmouseout="this.style.textDecoration='none'">${dispUrl}</a>
-            </td>
-            <td>${runBadge}</td>
-            <td style="text-align:center;white-space:nowrap;">${actionCell}</td>
-          </tr>`;
-        });
+        rows += `
+        <tr class="fade-in" style="${isMe ? "" : "opacity:.8;"}">
+          <td class="mono" style="color:var(--muted);font-size:12px;">${s.no}</td>
+          <td class="mono" style="font-weight:700;font-size:13px;">${s.pid}</td>
+          <td>${portBadge}</td>
+          <td class="mono" style="font-size:11px;">
+            <a href="${baseUrl}" target="_blank"
+               style="color:var(--blue);text-decoration:none;"
+               onmouseover="this.style.textDecoration='underline'"
+               onmouseout="this.style.textDecoration='none'">${baseUrl}</a>
+          </td>
+          <td>${badges}</td>
+          <td style="text-align:center;white-space:nowrap;">
+            <button class="btn btn-gray"
+              style="font-size:11px;padding:3px 8px;margin-right:4px;"
+              onclick="window.open('${baseUrl}','_blank')">🌐 Open</button>
+            ${killBtn}
+          </td>
+        </tr>`;
       }
     });
   });
@@ -936,7 +992,7 @@ function renderTable(list) {
   tbody.innerHTML = rows;
 }
 
-// ── Stats ──────────────────────────────────────────────
+
 function updateStats(list) {
   const total   = list.length;
   const running = list.filter(s => s.running.length > 0).length;
