@@ -1,39 +1,157 @@
 # digdag-wrapper
 
-서버 자동 기동 및 워크플로우 실행 최적화 기능을 갖춘 Digdag CLI 확장 래퍼 스크립트.
+A wrapper suite for Digdag that provides automated server lifecycle management, enhanced CLI commands, and a web-based monitoring dashboard — optimized for multi-user HPC environments.
 
-## 💡 What is Digdag?
+## 📦 Contents
 
-**Digdag**은 복잡한 데이터 파이프라인과 워크플로우를 단순하게 관리할 수 있도록 돕는 오픈소스 워크플로우 엔진입니다. Treasure Data에서 개발하였으며, 다음과 같은 강력한 특징을 가지고 있습니다.
+| File                         | Description                                 |
+| ---------------------------- | ------------------------------------------- |
+| `digdag.sh`                  | Main wrapper script with custom subcommands |
+| `digdag_dashboard.py`        | FastAPI-based web monitoring dashboard      |
+| `digdag_dashboard_launch.sh` | Launcher script for the dashboard           |
+| `xvfb_lib.sh`                | Xvfb helper library for headless execution  |
 
-- YAML 기반 정의: 복잡한 코딩 없이 .dig 설정 파일(YAML)만으로 태스크 간의 의존성(DAG)을 정의합니다.
-- 다양한 언어 지원: Shell, Python, SQL, Ruby 등 다양한 환경의 스크립트를 하나의 워크플로우 안에서 유기적으로 실행할 수 있습니다.
-- 서버 & 로컬 모드: 로컬에서 간단히 테스트하거나, 서버 모드로 띄워 스케줄링 및 UI를 통한 모니터링이 가능합니다.
-- 강력한 오류 제어: 실패한 태스크의 재시도(Retry), 에러 통보, 파라미터 전달 등을 유연하게 처리합니다.
+## 🔧 Requirements
 
-## 🚩 Why this Wrapper?
+- **Java** 8+ (required for Digdag)
+- **Python 3.8+** (for dashboard)
+- **Dependencies**: `fastapi`, `uvicorn`
+- **Optional**: `xvfb-run` (for headless browser access)
 
-Digdag은 매우 훌륭한 도구이지만, 실무 환경(특히 멀티 유저가 사용하는 컴퓨팅 팜이나 서버)에서 사용할 때는 몇 가지 번거로운 점이 있습니다.
+```bash
+# Install Python dependencies
+pip install fastapi uvicorn
+```
 
-- 서버 관리의 불편함: 매번 서버를 수동으로 띄우고 포트를 확인해야 합니다.
-- 경쟁 상태(Race Condition): 여러 사용자가 같은 서버 자원을 사용할 때 충돌이 발생할 수 있습니다.
-- 반복되는 명령어: push, start, check 등의 명령어를 매번 따로 입력해야 합니다.
+## 🚀 Quick Start
 
-본 프로젝트인 **digdag-wrapper**는 이러한 불편함을 해소하고, 서버 기동부터 워크플로우 실행까지 단 한 줄의 명령어로 자동화하여 작업 효율을 극대화합니다.
+### 1. Server Management
 
-## 🛠 Key Features of this Wrapper
+```bash
+# Start a persistent server (reuses existing if available)
+./digdag.sh start_server
 
-Auto-Server Lifecycle: 서버가 없으면 자동으로 빈 포트를 찾아 기동하고, 필요 시 종료합니다.
+# Run workflow: start server → push → start
+./digdag.sh run_workflow my_project my_workflow
 
-- Race Condition Protection: Lock 메커니즘을 통해 하나의 계정에서 중복된 서버가 실행되는 것을 방지합니다.
-- Smart Subcommands: run_workflow, list_job, kill_job 등 기존 CLI보다 직관적인 명령어를 제공합니다.
-- Environment Optimized: 고정된 임시 디렉토리 관리로 멀티 노드 환경에서도 안정적인 실행을 보장합니다.
+# Disposable mode: dedicated server per run, auto-shutdown
+./digdag.sh run_workflow --once my_project my_workflow
 
-## 커맨드 목록
+# Kill your server
+./digdag.sh kill_server
+```
 
-- digdag start_server : 서버 기동
-- digdag kill_server : 서버 종료
-- digdag run_workflow : 서버 기동 + push + start
-- digdag list_job : attempts 목록 조회
-- digdag kill_job : attempts kill
-- digdag browse : UI 열기
+### 2. Job Management
+
+```bash
+# List running jobs
+./digdag.sh list_job
+
+# List all jobs (including completed)
+./digdag.sh list_job --all
+
+# Kill a job
+./digdag.sh kill_job
+
+# Kill all jobs for a specific project
+./digdag.sh kill_job --all -p my_project
+```
+
+### 3. Dashboard (Web UI)
+
+```bash
+# Start dashboard and open browser
+./digdag_dashboard_launch.sh
+
+# Force restart dashboard
+./digdag_dashboard_launch.sh --restart
+
+# Stop dashboard
+./digdag_dashboard_launch.sh --stop
+```
+
+Access: `http://<host>:8765`
+
+### 4. Open Digdag UI
+
+```bash
+./digdag.sh browse
+```
+
+## 📋 Command Reference
+
+### digdag.sh
+
+| Command                                    | Description                                     |
+| ------------------------------------------ | ----------------------------------------------- |
+| `start_server`                             | Start a persistent server (one per user)        |
+| `kill_server`                              | Stop the server with confirmation               |
+| `list_server`                              | Show all running servers (table view)           |
+| `run_workflow <project> <workflow>`        | Boot server → push → start                      |
+| `run_workflow --once <project> <workflow>` | Disposable mode: auto-shutdown after completion |
+| `list_job`                                 | Show attempts (auto-select if single server)    |
+| `list_job --all`                           | Show all attempts including completed           |
+| `kill_job`                                 | Kill running attempts                           |
+| `browse`                                   | Open Digdag UI in browser                       |
+
+**Options for `run_workflow`:**
+
+| Option                     | Description                                    |
+| -------------------------- | ---------------------------------------------- |
+| `-d, --project <dir>`      | Project directory (default: current directory) |
+| `-P, --params-file <file>` | External parameter file                        |
+| `-L, --log <file>`         | Log file path (--once mode only)               |
+
+**Options for `list_job` / `kill_job`:**
+
+| Option          | Description                                    |
+| --------------- | ---------------------------------------------- |
+| `--all`         | Show/kill all statuses (default: running only) |
+| `-p <project>`  | Filter by project name                         |
+| `-w <workflow>` | Filter by workflow name                        |
+
+### digdag_dashboard_launch.sh
+
+| Flag        | Description                       |
+| ----------- | --------------------------------- |
+| (none)      | Start or reuse existing dashboard |
+| `--restart` | Kill existing and restart         |
+| `--stop`    | Stop dashboard only               |
+
+## 🏗 Architecture
+
+### File Structure
+
+```
+/tmp/digdag_<user>/
+├── server.log.<PID>   # Server log
+├── server.info        # PORT / PID / URL / STARTED
+├── server.lock        # Race condition prevention
+├── task-logs/         # Task execution logs
+├── jvm-tmp/           # JVM temp directory
+├── dashboard/         # Dashboard files
+│   ├── dashboard.pid  # "<PID> <PORT>"
+│   └── dashboard.log
+└── once.<timestamp>/  # Disposable server directories
+```
+
+### Key Features
+
+- **Per-user isolation**: Each OS user has their own server instance
+- **Race condition protection**: Lock mechanism prevents duplicate servers
+- **Auto port assignment**: Automatically finds free ports (base: 65432)
+- **Persistent execution**: `setsid` + `disown` detaches server from parent
+- **NFS-friendly**: Uses `/tmp` instead of home directory to save quota
+
+### Environment Variables
+
+| Variable         | Default                                      | Description                 |
+| ---------------- | -------------------------------------------- | --------------------------- |
+| `DIGDAG_JAR`     | `/user/qarepo/usr/local/digdag-0.10.5.1.jar` | Path to Digdag JAR          |
+| `DIGDAG_SH`      | `/user/qarepo/usr/local/bin/digdag.sh`       | Path to wrapper (dashboard) |
+| `DASHBOARD_PORT` | `8765`                                       | Dashboard web server port   |
+| `DASHBOARD_HOST` | `0.0.0.0`                                    | Dashboard bind address      |
+
+## 📄 License
+
+See [LICENSE](LICENSE) file.
