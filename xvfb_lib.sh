@@ -13,8 +13,8 @@
 
 # --- xvfb-run 존재 여부 확인 --------------------------------
 if ! command -v xvfb-run &>/dev/null; then
-    echo "[xvfb] ERROR: xvfb-run 이 설치되어 있지 않습니다."
-    echo "[xvfb]        sudo apt install xvfb  또는  yum install xorg-x11-server-Xvfb"
+    echo "[xvfb] ERROR: xvfb-run is not installed."
+    echo "[xvfb]        sudo apt install xvfb  or  yum install xorg-x11-server-Xvfb"
     exit 1
 fi
 
@@ -42,7 +42,7 @@ _xvfb_cleanup() {
 # --- 시그널 핸들러 ------------------------------------------
 _xvfb_signal_handler() {
     local sig="${1:-SIGTERM}"
-    echo "[xvfb] ${sig} 감지 → 자식 프로세스 종료 중..."
+    echo "[xvfb] ${sig} detected → terminating child process..."
 
     if [ -n "${_XVFB_CHILD_PID}" ]; then
         # setsid로 실행했으므로 PID == PGID → 그룹 전체 종료
@@ -76,7 +76,7 @@ _xvfb_signal_handler() {
 #   - xvfb_on_exit 훅 호출
 # ============================================================
 xvfb_run() {
-    echo "[xvfb] 실행: $*"
+    echo "[xvfb] Executing: $*"
 
     # setsid: 자식을 새 세션으로 분리 → PID == PGID 보장 → 그룹 kill 가능
     # xvfb-run: 보안/디스플레이 처리 위임
