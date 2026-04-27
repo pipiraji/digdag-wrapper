@@ -189,12 +189,15 @@ DIGDAG_BIN=(java -Djava.io.tmpdir="$DIGDAG_JVM_TMP" -jar "$DIGDAG_JAR")
 # ── Security 2: Cleanup orphan processes on interrupt (INT/TERM only) ──────────
 BOOTING_PID=""
 BOOT_SUCCESS=false
+OWNS_LOCK=false
 
 cleanup_on_exit() {
     if [ -n "$BOOTING_PID" ] && ! $BOOT_SUCCESS; then
         log "\n${YELLOW}[WARN] Execution interrupted. Cleaning up booting server (PID: $BOOTING_PID)${NC}"
         kill -9 "$BOOTING_PID" 2>/dev/null
-        rm -f "$LOCK_FILE"
+        # Only remove lock if this process owns it
+        # (avoids deleting lock owned by another start_server process)
+        $OWNS_LOCK && rm -f "$LOCK_FILE"
     fi
 }
 trap cleanup_on_exit INT TERM
@@ -242,6 +245,7 @@ start_server() {
 
     # ── Attempt lock acquisition (atomic: noclobber) ──────────────────
     if (set -C; echo $$ > "$LOCK_FILE") 2>/dev/null; then
+        OWNS_LOCK=true
 
         # ── First process: lock acquired -> boot server ─────
         log "  [LOCK] Lock acquired -> starting server boot (PID: $$)"
@@ -290,13 +294,15 @@ start_server() {
 
             if $BOOT_SUCCESS; then
                 # Security 3: Protect server.info permissions (owner read/write only)
-                cat > "$INFO_FILE" <<EOF
+                # Atomic write: write to tmp then mv to avoid race condition
+                cat > "${INFO_FILE}.tmp" <<EOF
 PORT=$port
 PID=$BOOTING_PID
 URL=http://$HOST_NAME:$port
 STARTED=$(date '+%Y-%m-%d %H:%M:%S')
 EOF
-                chmod 600 "$INFO_FILE"
+                chmod 600 "${INFO_FILE}.tmp"
+                mv "${INFO_FILE}.tmp" "$INFO_FILE"
 
                 # ── Watcher process ────────────────────────────
                 # kill -0 polling detects server exit -> auto-remove lock
@@ -375,6 +381,25 @@ EOF
 
 
 # ════════════════════════════════════════════════════════════
+#  Helper: find a free port (for --once servers)
+#  Scans randomly in range BASE_PORT~(BASE_PORT+32767)
+#  to minimize port collision in multi-user HPC environments.
+#  stdout: free port / exit 0=OK 1=not found
+# ════════════════════════════════════════════════════════════
+_get_free_port() {
+    local port i
+    for (( i=0; i<200; i++ )); do
+        port=$(( 49152 + RANDOM % 16384 ))   # dynamic port range: 49152~65535
+        if ! port_in_use $port; then
+            echo "$port"
+            return 0
+        fi
+    done
+    log "${RED}[ERROR] No free port found in range ${BASE_PORT}-$(( BASE_PORT + 32767 )).${NC}"
+    return 1
+}
+
+# ════════════════════════════════════════════════════════════
 #  --once dedicated server boot -> stdout: port / exit 0=OK 1=fail
 #
 #  Fully separated from start_server:
@@ -396,51 +421,49 @@ start_once_server() {
     # --once also uses dedicated tmpdir for DIGDAG_BIN
     local once_bin=(java -Djava.io.tmpdir="$once_jvm_tmp" -jar "$DIGDAG_JAR")
 
-    local port=$BASE_PORT
-    for (( i=1; i<=MAX_RETRIES; i++ )); do
+    local port
+    if ! port=$(_get_free_port); then
+        log "${RED}[ERROR] No free port available. Aborting.${NC}"
+        return 1
+    fi
+
+    log "  [OK] Port $port -> booting disposable server..."
+
+    setsid "${once_bin[@]}" server \
+        --bind 0.0.0.0 \
+        --port $port \
+        --memory \
+        --task-log "$once_task_log" \
+        > "$once_log" 2>&1 &
+
+    BOOTING_PID=$!
+    disown $BOOTING_PID
+
+    log -n "  [WAIT] Booting "
+    for (( j=1; j<=BOOT_TIMEOUT; j++ )); do
+        sleep 1; log -n "."
+        ! kill -0 "$BOOTING_PID" 2>/dev/null && { log " Process exit detected"; break; }
         if port_in_use $port; then
-            ((port++)); continue
+            log " Done! (${j}s)"
+            BOOT_SUCCESS=true; break
         fi
+    done
 
-        log "  [OK] Port $port -> booting disposable server..."
-
-        setsid "${once_bin[@]}" server \
-            --bind 0.0.0.0 \
-            --port $port \
-            --memory \
-            --task-log "$once_task_log" \
-            > "$once_log" 2>&1 &
-
-        BOOTING_PID=$!
-        disown $BOOTING_PID
-
-        log -n "  [WAIT] Booting "
-        for (( j=1; j<=BOOT_TIMEOUT; j++ )); do
-            sleep 1; log -n "."
-            ! kill -0 "$BOOTING_PID" 2>/dev/null && { log " Process exit detected"; break; }
-            if port_in_use $port; then
-                log " Done! (${j}s)"
-                BOOT_SUCCESS=true; break
-            fi
-        done
-
-        if $BOOT_SUCCESS; then
-            cat > "$once_info" <<EOF
+    if $BOOT_SUCCESS; then
+        # Atomic write
+        cat > "${once_info}.tmp" <<EOF
 PORT=$port
 PID=$BOOTING_PID
 URL=http://$HOST_NAME:$port
 STARTED=$(date '+%Y-%m-%d %H:%M:%S')
 EOF
-            chmod 600 "$once_info"
-            echo "$port"
-            return 0
-        fi
+        chmod 600 "${once_info}.tmp"
+        mv "${once_info}.tmp" "$once_info"
+        echo "$port"
+        return 0
+    fi
 
-        kill -9 "$BOOTING_PID" 2>/dev/null
-        BOOTING_PID=""
-        ((port++))
-    done
-
+    kill -9 "$BOOTING_PID" 2>/dev/null
     log "${RED}[ERROR] Disposable server boot failed${NC}"
     log "  Check log: $once_log"
     tail -n 10 "$once_log" >&2
